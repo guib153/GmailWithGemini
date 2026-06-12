@@ -1,0 +1,9 @@
+# OS metadata files
+.DS_Store
+Thumbs.db
+
+# User-specific sheets / local temp configs
+.gemini/
+scratch/
+*.log
+*.tmp
