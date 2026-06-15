@@ -9,6 +9,38 @@
 /*
 # 變更日誌 (Changelist / Change Note)
 
+## [3.0.0] - 2026-06-15
+
+### 變更動機 (Motivation)
+- **支援大規模批次處理**：繞過 GmailApp 的 100 封限制，並整合 Gemini 2.5 批次推論（一次傳送 10 封），大幅提升執行效率並降低免費版 15 RPM 的限制風險。
+- **導入「使用者自訂與學習雙軌制」**：不再依賴固定 Prompt，使用者可在 `AI_PromptConfig` 表格中隨時新增、調整分類與 Few-Shot 範例，並透過 `AI_LearningRules` 快取已判定過的規則，達成不呼叫 API 也能秒殺分類。
+- **新增每日晚間摘要通報**：針對全天已處理與標記信件發送每日晚報 (Daily Digest) 電子郵件。
+
+### 影響檔案 (Affected Files)
+- [Gmail-with-gemini.gs]
+- [CHANGELOG.gs]
+- [appsscript.json]
+
+### 詳細變更 (Detailed Changes)
+- **架構升級 (v3.0 批次處理)**：
+  - 導入 `callGeminiApiBatch` 取代原先的單筆處理，透過 JSON 陣列要求 Gemini 一次對 10 封信件進行結構化輸出。
+  - 將 5000ms 延遲改至批次層級，批次內不再延遲。
+- **自訂配置工作表 (`AI_PromptConfig`)**：
+  - 在首次執行時自動建立 `AI_PromptConfig`，讓使用者直接在試算表設定 AI 分類項目、描述與 Few-Shot 範例。
+  - 主程式執行前會呼叫 `buildPromptFromSheet` 動態構建分類指令。
+- **自學規則快取 (`AI_LearningRules`)**：
+  - 當 AI 分類完成後，除寫入日誌外，同時記錄寄件人特徵至 `AI_LearningRules`。
+  - 下次執行時，若寄件者已在學習庫中，直接免 API 進行分類並發送。
+- **未分類人工覆核機制 (`AI_Uncategorized`)**：
+  - 將解析失敗或緊急度異常的信件移至 `AI_Uncategorized`，方便使用者進行覆核並加入學習庫。
+- **每日晚間摘要 (`sendDailyDigest`)**：
+  - 新增晚上八點自動執行摘要函式，收集當天已分類的數量、各類別佔比，並寄送 Email 通知。
+  - `setupTriggers` 自動註冊每日 20:00 的 `sendDailyDigest` 排程。
+  - `appsscript.json` 中新增 `https://www.googleapis.com/auth/script.send_mail` 權限。
+
+### 後續待辦事項與技術斷點 (Next Steps & Technical Breakpoints)
+- 無。
+
 ## [2.0.0] - 2026-06-14
 
 ### 變更動機 (Motivation)
