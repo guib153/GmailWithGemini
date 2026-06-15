@@ -1,0 +1,752 @@
+/**
+ * @OnlyCurrentDoc
+ * 
+ * GmailWithGemini — 智慧郵件 AI 自動分類與分頁系統
+ * 
+ * 【系統簡介】
+ * 本系統利用 Gemini 2.5 Flash API 提供 100% 即時 AI 語意判定，自動將未讀郵件進行 9 大類別分類、
+ * 擷取 20 字內關鍵核心摘要（AI Refined Content）並同步移入對應的 Gmail 收件匣分頁（主要、社群、宣傳、最新快訊）。
+ * 系統並具有內建的 Poison Pill 防卡死機制與執行日誌自動美化功能。
+ * 
+ * 【使用與部署】
+ * 詳細的安裝指南、API 金鑰配置與定時排程設定，請參閱本專案 GitHub 倉庫中的 README.md 說明文件。
+ * 
+ * @version 1.5.0
+ * @date 2026-06-12
+ */
+
+// ==================== 全域設定 ====================
+// 1. 指令碼屬性中的 Gemini API 金鑰名稱
+const GEMINI_API_KEY_PROPERTY = 'GEMINI_API_KEY';
+
+// 2. Gmail 搜尋篩選條件 (排除已標籤的未讀信件，防止重複判讀)
+const GMAIL_SEARCH_QUERY = 'is:unread -label:"AI/工作" -label:"AI/財務帳單" -label:"AI/個人消費" -label:"AI/系統通知" -label:"AI/登入成功通知" -label:"AI/廣告行銷" -label:"AI/社群通知" -label:"AI/個人隱私" -label:"AI/Netflix" -label:"AI/未分類"';
+
+
+// 3. 每次掃描的信件對話串最大數量
+const MAX_THREADS_TO_SCAN = 50;
+
+// 4. 是否預設從時間最早 (最舊) 的郵件開始整理
+const PROCESS_OLDEST_FIRST = true;
+
+// 5. 單封郵件內文擷取字數上限，避免 Token 爆炸
+const EMAIL_BODY_CHAR_LIMIT = 1000;
+
+// 5. 規則對照工作表名稱
+const RULES_SHEET_NAME = 'AI_Rules';
+
+// 5.1 執行統計日誌工作表名稱
+const EXECUTION_LOG_SHEET_NAME = 'AI_Execution_Log';
+
+// 6. 獨立試算表名稱（僅用於獨立腳本首次建立時）
+const STANDALONE_SPREADSHEET_NAME = 'GmailWithGemini_Rules';
+
+// 7. 指令碼屬性中的獨立試算表 ID 名稱
+const STANDALONE_SPREADSHEET_PROPERTY = 'RULES_SHEET_ID';
+
+// 8. 呼叫 API 之間的緩衝時間 (毫秒)，防止頻率限制
+const API_CALL_DELAY_MS = 1500;
+
+// 9. AI 分類對應的 Gmail 收件匣系統分頁標籤 ID
+const CATEGORY_TAB_MAPPING = {
+  "工作": "CATEGORY_PERSONAL",
+  "財務帳單": "CATEGORY_UPDATES",
+  "個人消費": "CATEGORY_UPDATES",
+  "系統通知": "CATEGORY_UPDATES",
+  "登入成功通知": "CATEGORY_UPDATES",
+  "廣告行銷": "CATEGORY_PROMOTIONS",
+  "社群通知": "CATEGORY_SOCIAL",
+  "個人隱私": "CATEGORY_PERSONAL",
+  "Netflix": "CATEGORY_UPDATES",
+  "未分類": "CATEGORY_PERSONAL"
+};
+// =========================================================================
+
+// =========================================================================
+// ==================== 可單獨執行之入口函式說明 (Runnable Functions) ====================
+// =========================================================================
+/**
+ * 1. autoOrganizeGmailWithGemini()
+ *    - 說明：智慧郵件分類主程式。
+ *    - 用途：掃描未讀信件，進行 AI 語意類別/緊急度判讀、自動精煉 20 字重點、貼上 Gmail 自訂標籤、移往對應 Gmail 收件匣分頁，並在試算表寫入日誌記錄。
+ *    - 使用方式：可手動單次點擊「執行」進行測試，或是設定為「時間驅動」的定時觸發條件（如每 10 分鐘或每小時自動運行）。
+ * 
+ * 2. syncExistingLabeledThreadsToCategories()
+ *    - 說明：歷史信件收件匣分頁一鍵同步工具。
+ *    - 用途：掃描您收件匣中所有「過去已被貼上 AI/工作、AI/社群通知 等自訂標籤」的舊信件，直接調用 API 把對應的 Gmail 系統分頁標籤補上去。
+ *    - 使用方式：當您首次啟用收件匣分頁歸類功能時，手動點擊執行此函式一次。此操作完全是讀取現有自訂標籤，100% 不會呼叫 Gemini API，完全不消耗您的免費額度。
+ */
+function autoOrganizeGmailWithGemini() {
+  // 1. 初始化統計變數
+  let successCount = 0;
+  let failureCount = 0;
+  let highUrgencyCount = 0;
+  let mediumUrgencyCount = 0;
+  let lowUrgencyCount = 0;
+  let categoryStats = {};
+  let minDate = null;
+  let maxDate = null;
+  let runSuccess = "Y";
+  let executionError = "";
+  const executionTime = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm");
+
+  // 從安全屬性中取得您的 Gemini API 金鑰
+  const apiKey = PropertiesService.getScriptProperties().getProperty(GEMINI_API_KEY_PROPERTY);
+  if (!apiKey) {
+    Logger.log("Error: GEMINI_API_KEY is not set in script properties.");
+    return;
+  }
+
+  try {
+    // 2. 搜尋未讀且未分類之信件 (擷取最多 50 封以利排序)
+    let threads = GmailApp.search(GMAIL_SEARCH_QUERY, 0, 50);
+    
+    if (threads.length === 0) {
+      Logger.log("No unread threads found.");
+      return;
+    }
+    
+    // 3. 如果設定為最舊郵件優先，則反轉搜尋結果陣列
+    if (PROCESS_OLDEST_FIRST) {
+      threads.reverse();
+      Logger.log("Reversed search threads to process oldest first.");
+    }
+    
+    // 截取設定的最大掃描處理數量
+    threads = threads.slice(0, MAX_THREADS_TO_SCAN);
+    
+    Logger.log(`Processing ${threads.length} target thread(s) for classification...`);
+
+    // 取得試算表工作表 (僅用於寫入分類日誌)
+    let sheet;
+    try {
+      sheet = getOrCreateRulesSheet();
+    } catch (sheetError) {
+      Logger.log("Failed to initialize rules sheet: " + sheetError.toString());
+    }
+
+    // 4. 逐一處理郵件對話串
+    threads.forEach((thread, index) => {
+      // 緩衝呼叫避免 API 頻率限制
+      if (index > 0) {
+        Utilities.sleep(API_CALL_DELAY_MS);
+      }
+      
+      try {
+        const messages = thread.getMessages();
+        if (messages.length === 0) return;
+        
+        const lastMessage = messages[messages.length - 1];
+        const rawSender = lastMessage.getFrom();
+        const senderEmail = extractCleanEmail(rawSender);
+        const subject = lastMessage.getSubject();
+        
+        // 擷取信件主旨與部分內文
+        const body = lastMessage.getPlainBody().substring(0, EMAIL_BODY_CHAR_LIMIT);
+        
+        Logger.log(`Scanning Email [${index + 1}/${threads.length}] from: ${senderEmail} | Subject: [${subject}]`);
+        
+        // 呼叫 API 判讀
+        let category = null;
+        let urgency = null;
+        let refinedContent = "";
+        
+        try {
+          const result = callGeminiApi(apiKey, senderEmail, subject, body);
+          if (result && result.category && result.urgency) {
+            category = result.category;
+            urgency = result.urgency;
+            refinedContent = result.refinedContent || "";
+            
+            // 累加統計
+            successCount++;
+            categoryStats[category] = (categoryStats[category] || 0) + 1;
+            
+            if (urgency === "高") highUrgencyCount++;
+            else if (urgency === "中") mediumUrgencyCount++;
+            else if (urgency === "低") lowUrgencyCount++;
+            
+            // 計算收件日期範圍
+            const threadDate = thread.getLastMessageDate();
+            if (!minDate || threadDate < minDate) minDate = threadDate;
+            if (!maxDate || threadDate > maxDate) maxDate = threadDate;
+          } else {
+            failureCount++;
+            Logger.log("API returned invalid schema content.");
+            // 降級處理：設定為「未分類」，避免重複判讀失敗導致佇列卡死
+            category = "未分類";
+            urgency = "低";
+            refinedContent = "API判讀失敗，降級為未分類";
+          }
+        } catch (apiError) {
+          failureCount++;
+          Logger.log("Failed to process API call for thread: " + apiError.toString());
+          // 降級處理：設定為「未分類」，避免重複判讀失敗導致佇列卡死
+          category = "未分類";
+          urgency = "低";
+          refinedContent = "API異常：" + apiError.toString();
+        }
+        
+        // 將分類結果與資訊精煉記錄至試算表中
+        if (category && sheet) {
+          try {
+            const searchQuery = `from:${senderEmail}`;
+            const nowString = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss");
+            const senderName = extractSenderName(rawSender);
+            sheet.appendRow([senderEmail, senderName, category, urgency, refinedContent, searchQuery, nowString]);
+            Logger.log(`Logged email classification details for: ${senderEmail}`);
+          } catch (saveError) {
+            Logger.log("Failed to write log to sheet: " + saveError.toString());
+          }
+        }
+        
+        // 執行分類標籤套用動作
+        if (category) {
+          Logger.log(`Applying action: ${category} (${urgency}) for Email: [${subject}]`);
+          const labelName = "AI/" + category;
+          let label = GmailApp.getUserLabelByName(labelName);
+          if (!label) {
+            label = GmailApp.createLabel(labelName);
+          }
+          thread.addLabel(label);
+          
+          // 同步移至對應的 Gmail 收件匣分頁中
+          const tabLabelId = CATEGORY_TAB_MAPPING[category];
+          if (tabLabelId) {
+            moveThreadToGmailCategory(thread.getId(), tabLabelId);
+          }
+        }
+      } catch (threadError) {
+        failureCount++;
+        Logger.log(`Error processing thread at index ${index}: ` + threadError.toString());
+      }
+    });
+    Logger.log("All unread emails processed!");
+    
+  } catch (error) {
+    runSuccess = "N";
+    executionError = error.toString();
+    Logger.log("Exception occurred during main process: " + executionError);
+  } finally {
+    // 5. 確保在執行結束時，必定寫入執行統計日誌
+    try {
+      writeExecutionLog(executionTime, minDate, maxDate, successCount, failureCount, highUrgencyCount, mediumUrgencyCount, lowUrgencyCount, categoryStats, runSuccess, executionError);
+    } catch (logError) {
+      Logger.log("Fatal: Failed to write execution log sheet: " + logError.toString());
+    }
+  }
+}
+
+/**
+ * 一次性歷史信件歸類工具。
+ * 掃描所有歷史已歸類標籤 (AI/*) 的信件，並將其自動同步移至對應的 Gmail 分頁中。
+ * 此執行完全不需呼叫 Gemini API。
+ */
+function syncExistingLabeledThreadsToCategories() {
+  Logger.log("Starting historical email category migration...");
+  try {
+    for (const category in CATEGORY_TAB_MAPPING) {
+      const tabLabelId = CATEGORY_TAB_MAPPING[category];
+      const labelName = "AI/" + category;
+      const label = GmailApp.getUserLabelByName(labelName);
+      if (!label) continue;
+      
+      try {
+        // 擷取前 100 封信（可根據需要重複執行以消化更大信量）
+        const threads = label.getThreads(0, 100);
+        Logger.log(`Found ${threads.length} threads labeled with '${labelName}'. Moving to ${tabLabelId}...`);
+        
+        threads.forEach((thread, index) => {
+          if (index > 0) {
+            Utilities.sleep(150); // 防範 API 頻率過載
+          }
+          moveThreadToGmailCategory(thread.getId(), tabLabelId);
+        });
+      } catch (labelError) {
+        Logger.log(`Error processing label '${labelName}': ` + labelError.toString());
+      }
+    }
+    Logger.log("Historical email category migration completed!");
+  } catch (globalError) {
+    Logger.log("Fatal error during historical email category migration: " + globalError.toString());
+  }
+}
+
+// 核心函式：傳送資料給 Gemini API 並強制要求 JSON 結構
+function callGeminiApi(apiKey, sender, subject, body) {
+  // 使用最新的 2.5 Flash 模型，兼具速度與準確度
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+  
+  const promptText = `您是一位專業的智慧郵件分類秘書。請詳細分析以下郵件的寄件者、標題與內文，並依據分類規範決定其類別與緊急度。同時，請精煉該信件的關鍵核心內容。
+
+【處理步驟指引 (Chain of Thought)】
+1. **識別寄件主體**：判斷寄件者是何種平台或組織（如：LinkedIn、銀行、蝦皮、一般聯絡人）。
+2. **區分受眾屬性**：分析此郵件是「僅針對收件人個人的互動/通知」（如私訊、面試邀請、個人交易、帳戶警報），或是「批次群發的非即時摘要/推廣」（如職缺週報、動態摘要、折價券廣告）。
+3. **匹配分類與緊急度**：依據以下規範進行分類與緊急度評估。
+4. **資訊提煉**：精煉出 20 字以內之郵件大意（去除一切無關語氣助詞，僅保留關鍵資訊與數據）。
+
+【分類類別規範】
+1. 「工作」：專屬個人的商務溝通、工作任務協作通知、求職互動信件（如：104人力銀行面試邀請）、社群平台個人對話（如：LinkedIn 專屬私訊/聯絡人信件）。
+   *注意*：必須是針對收件者個人的互動或行動信件。若為群發的職缺電子報或動態摘要，必須分類為「社群通知」或「廣告行銷」。
+2. 「財務帳單」：銀行交易明細、電子發票、帳單繳費通知、收據憑證、信用卡消費通知。
+3. 「個人消費」：線上購物訂單確認、出貨/送達通知、外送平台明細、線下實體店面消費發票。
+4. 「系統通知」：自動化系統警報、帳號啟用信、安全性驗證碼 (OTP)。
+5. 「登入成功通知」：各家銀行或網站服務發送之安全「登入成功」確認信。
+6. 「廣告行銷」：電子報、促銷廣告、折價券、產品推廣信。
+7. 「社群通知」：社群平台群發的推廣或動態摘要信（如：LinkedIn 職缺推薦週報、Facebook 動態摘要）。
+8. 「個人隱私」：親友的個人來信、私人旅遊訂房/機票確認信。
+9. 「Netflix」：Netflix（含 @account.netflix.com 或 netflix.com 域名）發送之所有信件，例如：電子發票收據、帳戶安全提示、推薦觀看片單。
+
+【緊急度評判規範】
+- 「高」：需要即時關注或動作之信件。例如：驗證碼 (OTP)、登入異常安全警報、信用卡消費疑慮、急需處理的工作阻礙。
+- 「中」：有時效性但無須立刻處理之信件。例如：幾天內到期的繳費帳單、工作會議預約、待辦任務。
+- 「低」：單純資訊告知或不具時效性之信件。例如：廣告行銷促銷、登入成功通知、社群動態提醒。
+
+【範例對照指引 (Few-Shot Examples)】
+- *範例 1 (工作個人私訊)*：
+  - 寄件者：\`LinkedIn <messages-noreply@linkedin.com>\`，標題：\`王大明傳送了訊息給您\`，內文：\`嗨，我看到您的履歷，想跟您聊聊...\`
+  - 判定結果：\`category: "工作"\`, \`urgency: "中"\`, \`refinedContent: "LinkedIn私訊-王大明:想聊聊履歷"\`
+- *範例 2 (社群群發週報)*：
+  - 寄件者：\`LinkedIn <jobs-listings@linkedin.com>\`，標題：\`王大明，這些是適合您的職缺\`，內文：\`這週有 15 個符合您軟體工程師背景的新職缺...\`
+  - 判定結果：\`category: "社群通知"\`, \`urgency: "低"\`, \`refinedContent: "LinkedIn-軟體工程師職缺推薦週報"\`
+- *範例 3 (個人消費訂單)*：
+  - 寄件者：\`Shopee <info@shopee.tw>\`，標題：\`訂單成立通知\`，內文：\`感謝您的消費，訂單編號 123456 已成立，消費金額 NT$ 500 元...\`
+  - 判定結果：\`category: "個人消費"\`, \`urgency: "低"\`, \`refinedContent: "蝦皮購物-訂單成立-金額NT$500"\`
+- *範例 4 (登入成功通知)*：
+  - 寄件者：\`kgi@kgibank.com.tw\`，標題：\`網路銀行登入成功通知\`，內文：\`您於 2026-06-11 12:00 成功登入網路銀行，若非本人請聯絡客服...\`
+  - 判定結果：\`category: "登入成功通知"\`, \`urgency: "低"\`, \`refinedContent: "凱基銀行-登入成功提醒"\`
+- *範例 5 (系統高防護通知)*：
+  - 寄件者：\`service@shopee.tw\`，標題：\`帳號變更驗證碼\`，內文：\`您的驗證碼為 987654，請於 5 分鐘內輸入完畢。\`
+  - 判定結果：\`category: "系統通知"\`, \`urgency: "高"\`, \`refinedContent: "蝦皮購物-驗證碼:987654"\`
+- *範例 6 (Netflix 登入驗證碼)*：
+  - 寄件者：\`info@account.netflix.com\`，標題：\`Netflix：您的登入碼\`，內文：\`您的登入碼為 123456，請在 15 分鐘內輸入...\`
+  - 判定結果：\`category: "Netflix"\`, \`urgency: "高"\`, \`refinedContent: "Netflix-登入碼:123456"\`
+- *範例 7 (Netflix 同戶裝置確認)*：
+  - 寄件者：\`info@account.netflix.com\`，標題：\`確認信：您已確認Netflix 同戶裝置\`，內文：\`您的電視已設定為此帳號的同戶裝置之一...\`
+  - 判定結果：\`category: "Netflix"\`, \`urgency: "中"\`, \`refinedContent: "Netflix-同戶裝置已確認"\`
+
+待分析郵件內容：
+---
+寄件者：${sender}
+標題：${subject}
+內文：${body}
+---
+請嚴格依據規定的 JSON Schema 結構輸出分析結果。`;
+
+  // 設定 API 請求內容與強制的 Schema 結構
+  const payload = {
+    "contents": [{
+      "parts": [{ "text": promptText }]
+    }],
+    "generationConfig": {
+      "responseMimeType": "application/json", // 強制輸出 JSON 格式
+      "responseSchema": {
+        "type": "OBJECT",
+        "properties": {
+          "category": {
+            "type": "STRING",
+            "enum": ["工作", "財務帳單", "個人消費", "系統通知", "登入成功通知", "廣告行銷", "社群通知", "個人隱私", "Netflix"]
+          },
+          "urgency": {
+            "type": "STRING",
+            "enum": ["高", "中", "低"]
+          },
+          "refinedContent": {
+            "type": "STRING"
+          }
+        },
+        "required": ["category", "urgency", "refinedContent"]
+      }
+    }
+  };
+
+  const options = {
+    "method": "post",
+    "contentType": "application/json",
+    "payload": JSON.stringify(payload),
+    "muteHttpExceptions": true
+  };
+
+  try {
+    const response = UrlFetchApp.fetch(url, options);
+    const responseText = response.getContentText();
+    
+    if (response.getResponseCode() === 200) {
+      const json = JSON.parse(responseText);
+      if (json && json.candidates && json.candidates[0] && json.candidates[0].content && json.candidates[0].content.parts && json.candidates[0].content.parts[0]) {
+        const contentText = json.candidates[0].content.parts[0].text;
+        try {
+          return JSON.parse(contentText);
+        } catch (parseError) {
+          Logger.log("Failed to parse Gemini JSON response content: " + parseError.toString());
+          return null;
+        }
+      } else {
+        Logger.log("Unexpected Gemini API response structure: " + responseText);
+        return null;
+      }
+    } else {
+      Logger.log("Gemini API Error: " + responseText);
+      return null;
+    }
+  } catch (e) {
+    Logger.log("Exception occurred during API call: " + e.toString());
+    return null;
+  }
+}
+
+/**
+ * 擷取乾淨的電子信箱地址 (小寫)
+ * @param {string} emailString 原始信件地址字串
+ * @return {string} 乾淨的信箱地址
+ */
+function extractCleanEmail(emailString) {
+  if (!emailString) return "";
+  const match = emailString.match(/<([^>]+)>/);
+  if (match) {
+    return match[1].trim().toLowerCase();
+  }
+  return emailString.trim().toLowerCase();
+}
+
+/**
+ * 美化試算表排版外觀並設定緊急度條件格式化規則
+ * @param {Sheet} sheet Google Sheets 工作表物件
+ */
+function formatSheetAesthetics(sheet) {
+  // 1. 設定欄位寬度防止內容遮擋
+  sheet.setColumnWidth(1, 240); // 電子信箱
+  sheet.setColumnWidth(2, 160); // 寄件者名稱
+  sheet.setColumnWidth(3, 110); // 類別
+  sheet.setColumnWidth(4, 90);  // 緊急度
+  sheet.setColumnWidth(5, 280); // AI 精煉內容
+  sheet.setColumnWidth(6, 200); // Gmail 搜尋字串
+  sheet.setColumnWidth(7, 160); // 更新時間
+  
+  // 2. 套用 A1:G1000 之交替背景色彩 (斑馬線)
+  const fullRange = sheet.getRange("A1:G1000");
+  fullRange.clearFormat(); // 清除舊格式
+  
+  // 清理現存的所有交替背景設定 (Bandings) 避免衝突
+  const bandings = sheet.getBandings();
+  bandings.forEach(banding => banding.remove());
+  
+  fullRange.setAlternatingRowColors(
+    "#FFFFFF", // 奇數行
+    "#F7FAFC", // 偶數行
+    "#2D3748"  // 標題行
+  );
+  
+  // 3. 設定標題列樣式 ( setAlternatingRowColors 會重製背景，需再將標題文字改為純白粗體)
+  const headerRange = sheet.getRange(1, 1, 1, 7);
+  headerRange.setFontFamily("Arial")
+             .setFontSize(10)
+             .setFontWeight("bold")
+             .setFontColor("#FFFFFF")
+             .setHorizontalAlignment("center")
+             .setVerticalAlignment("middle");
+             
+  sheet.setRowHeight(1, 28); // 設定標題列高度
+  
+  // 4. 設定資料欄之水平與垂直對齊
+  sheet.getRange("A2:A1000").setHorizontalAlignment("left").setVerticalAlignment("middle");
+  sheet.getRange("B2:B1000").setHorizontalAlignment("left").setVerticalAlignment("middle");
+  sheet.getRange("C2:C1000").setHorizontalAlignment("center").setVerticalAlignment("middle");
+  sheet.getRange("D2:D1000").setHorizontalAlignment("center").setVerticalAlignment("middle");
+  sheet.getRange("E2:E1000").setHorizontalAlignment("left").setVerticalAlignment("middle");
+  sheet.getRange("F2:F1000").setHorizontalAlignment("left").setVerticalAlignment("middle");
+  sheet.getRange("G2:G1000").setHorizontalAlignment("center").setVerticalAlignment("middle");
+  
+  // 5. 設定緊急度 (D欄) 條件格式化規則 (高:紅, 中:黃, 低:綠)
+  const urgencyRange = sheet.getRange("D2:D1000");
+  
+  const ruleHigh = SpreadsheetApp.newConditionalFormatRule()
+      .whenTextEqualTo("高")
+      .setBackground("#FEE2E2") // 淺紅
+      .setFontColor("#991B1B") // 深紅
+      .bold(true)
+      .setRanges([urgencyRange])
+      .build();
+      
+  const ruleMedium = SpreadsheetApp.newConditionalFormatRule()
+      .whenTextEqualTo("中")
+      .setBackground("#FEF3C7") // 淺黃
+      .setFontColor("#92400E") // 深黃
+      .bold(true)
+      .setRanges([urgencyRange])
+      .build();
+      
+  const ruleLow = SpreadsheetApp.newConditionalFormatRule()
+      .whenTextEqualTo("低")
+      .setBackground("#DCFCE7") // 淺綠
+      .setFontColor("#166534") // 深綠
+      .setRanges([urgencyRange])
+      .build();
+      
+  sheet.setConditionalFormatRules([ruleHigh, ruleMedium, ruleLow]);
+  Logger.log("Applied premium aesthetic formats and conditional rules to AI_Rules sheet.");
+}
+
+/**
+ * 取得或自動建立 AI_Rules 工作表
+ * @return {Sheet} Google Sheets 工作表物件
+ */
+function getOrCreateRulesSheet() {
+  let ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    const properties = PropertiesService.getScriptProperties();
+    let sheetId = properties.getProperty(STANDALONE_SPREADSHEET_PROPERTY);
+    if (sheetId) {
+      try {
+        ss = SpreadsheetApp.openById(sheetId);
+      } catch (e) {
+        Logger.log("Failed to open spreadsheet by ID, creating a new one: " + e.toString());
+      }
+    }
+    if (!ss) {
+      ss = SpreadsheetApp.create(STANDALONE_SPREADSHEET_NAME);
+      properties.setProperty(STANDALONE_SPREADSHEET_PROPERTY, ss.getId());
+      Logger.log("Created a new standalone rules spreadsheet with ID: " + ss.getId());
+    }
+  }
+  
+  let sheet = ss.getSheetByName(RULES_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(RULES_SHEET_NAME);
+    // 初始化標題列
+    sheet.appendRow(["Email", "Sender Name", "Category", "Urgency", "AI Refined Content", "Gmail Search Query", "Updated Time"]);
+    sheet.setFrozenRows(1);
+    formatSheetAesthetics(sheet);
+    Logger.log("Created AI_Rules sheet and applied aesthetic rules.");
+  } else if (sheet.getLastRow() === 0 || sheet.getLastColumn() === 0) {
+    // 自我修復：若工作表內容被清空，重新寫入標題與格式化
+    sheet.appendRow(["Email", "Sender Name", "Category", "Urgency", "AI Refined Content", "Gmail Search Query", "Updated Time"]);
+    sheet.setFrozenRows(1);
+    formatSheetAesthetics(sheet);
+    Logger.log("Recovered empty AI_Rules sheet headers and applied aesthetics.");
+  } else {
+    // 升級舊版格式 (如果缺少 Sender Name 欄位)
+    if (sheet.getLastColumn() > 0 && sheet.getRange(1, 2).getValue() !== "Sender Name") {
+      sheet.insertColumnBefore(2);
+      sheet.getRange(1, 2).setValue("Sender Name");
+      Logger.log("Migrated AI_Rules sheet: Inserted 'Sender Name' column at index 2.");
+    }
+    // 升級舊版格式 (如果缺少 AI Refined Content 欄位)
+    if (sheet.getLastColumn() > 0 && sheet.getRange(1, 5).getValue() !== "AI Refined Content") {
+      sheet.insertColumnBefore(5);
+      sheet.getRange(1, 5).setValue("AI Refined Content");
+      Logger.log("Migrated AI_Rules sheet: Inserted 'AI Refined Content' column at index 5.");
+    }
+    // 套用易讀外觀排版樣式與條件規則
+    formatSheetAesthetics(sheet);
+  }
+  return sheet;
+}
+
+/**
+ * 擷取寄件者名稱
+ * @param {string} senderString 原始寄件者欄位字串 (如 "KGI Bank <card999@kgibank.com>")
+ * @return {string} 寄件者名稱
+ */
+function extractSenderName(senderString) {
+  if (!senderString) return "";
+  const match = senderString.match(/^"?([^"<]+)"?\s*</);
+  if (match) {
+    return match[1].trim();
+  }
+  const emailMatch = senderString.match(/^([^@]+)@/);
+  if (emailMatch) {
+    return emailMatch[1].trim();
+  }
+  return senderString.trim();
+}
+
+/**
+ * 寫入執行統計日誌至單獨的工作表中
+ */
+function writeExecutionLog(timeString, minDate, maxDate, successCount, failureCount, highUrgency, mediumUrgency, lowUrgency, categoryStats, successYn, errorMsg) {
+  const sheet = getOrCreateExecutionLogSheet();
+  if (!sheet) return;
+  
+  // 1. 彙整信件收件時間區間字串
+  let dateRangeStr = "N/A";
+  if (minDate && maxDate) {
+    const tz = Session.getScriptTimeZone();
+    const minStr = Utilities.formatDate(minDate, tz, "yyyy-MM-dd HH:mm");
+    const maxStr = Utilities.formatDate(maxDate, tz, "yyyy-MM-dd HH:mm");
+    dateRangeStr = `${minStr} ~ ${maxStr}`;
+  }
+  
+  // 2. 彙整分類佔比字串 (例如：工作(2), Netflix(1))
+  const statsList = [];
+  for (const cat in categoryStats) {
+    statsList.push(`${cat}(${categoryStats[cat]})`);
+  }
+  const categoryBreakdown = statsList.length > 0 ? statsList.join(", ") : "None";
+  
+  // 3. 寫入列資料：Execution Time, Email Date Range, Success Count, Failure Count, High, Medium, Low, Category Distribution, Finished Successfully, Error Message
+  sheet.appendRow([timeString, dateRangeStr, successCount, failureCount, highUrgency, mediumUrgency, lowUrgency, categoryBreakdown, successYn, errorMsg]);
+  Logger.log("Successfully logged execution stats.");
+}
+
+/**
+ * 取得或自動建立 AI_Execution_Log 工作表
+ * @return {Sheet} Google Sheets 工作表物件
+ */
+function getOrCreateExecutionLogSheet() {
+  let ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    const properties = PropertiesService.getScriptProperties();
+    let sheetId = properties.getProperty(STANDALONE_SPREADSHEET_PROPERTY);
+    if (sheetId) {
+      try {
+        ss = SpreadsheetApp.openById(sheetId);
+      } catch (e) {
+        Logger.log("Failed to open spreadsheet by ID: " + e.toString());
+      }
+    }
+  }
+  if (!ss) return null;
+  
+  let sheet = ss.getSheetByName(EXECUTION_LOG_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(EXECUTION_LOG_SHEET_NAME);
+    // 初始化標題
+    sheet.appendRow(["Execution Time", "Email Date Range", "Success Count", "Failure Count", "High Urgency", "Medium Urgency", "Low Urgency", "Category Distribution", "Finished Successfully", "Error Message"]);
+    sheet.setFrozenRows(1);
+    formatExecutionLogSheetAesthetics(sheet);
+    Logger.log("Created AI_Execution_Log sheet and initialized formatting.");
+  } else if (sheet.getLastRow() === 0 || sheet.getLastColumn() === 0) {
+    // 自我修復：如果工作表被清空，重置標題與格式
+    sheet.appendRow(["Execution Time", "Email Date Range", "Success Count", "Failure Count", "High Urgency", "Medium Urgency", "Low Urgency", "Category Distribution", "Finished Successfully", "Error Message"]);
+    sheet.setFrozenRows(1);
+    formatExecutionLogSheetAesthetics(sheet);
+    Logger.log("Recovered empty AI_Execution_Log sheet headers.");
+  }
+  return sheet;
+}
+
+/**
+ * 美化統計日誌工作表排版外觀並設定執行狀態條件格式化規則
+ * @param {Sheet} sheet Google Sheets 工作表物件
+ */
+function formatExecutionLogSheetAesthetics(sheet) {
+  // 1. 設定欄位寬度
+  sheet.setColumnWidth(1, 140);  // Execution Time
+  sheet.setColumnWidth(2, 260);  // Email Date Range
+  sheet.setColumnWidth(3, 100);  // Success Count
+  sheet.setColumnWidth(4, 100);  // Failure Count
+  sheet.setColumnWidth(5, 90);   // High Urgency
+  sheet.setColumnWidth(6, 90);   // Medium Urgency
+  sheet.setColumnWidth(7, 90);   // Low Urgency
+  sheet.setColumnWidth(8, 220);  // Category Distribution
+  sheet.setColumnWidth(9, 160);  // Finished Successfully
+  sheet.setColumnWidth(10, 260); // Error Message
+  
+  // 2. 套用 A1:J1000 之交替背景底色 (斑馬線)
+  const fullRange = sheet.getRange("A1:J1000");
+  fullRange.clearFormat(); // 清除舊格式
+  
+  const bandings = sheet.getBandings();
+  bandings.forEach(banding => banding.remove());
+  
+  fullRange.setAlternatingRowColors(
+    "#FFFFFF", // 奇數行
+    "#F7FAFC", // 偶數行
+    "#2D3748"  // 標題行
+  );
+  
+  // 3. 設定標題列樣式 (純白粗體)
+  const headerRange = sheet.getRange(1, 1, 1, 10);
+  headerRange.setFontFamily("Arial")
+             .setFontSize(10)
+             .setFontWeight("bold")
+             .setFontColor("#FFFFFF")
+             .setHorizontalAlignment("center")
+             .setVerticalAlignment("middle");
+             
+  sheet.setRowHeight(1, 28); // 設定高度
+  
+  // 4. 設定資料欄之水平置中與對齊方式
+  sheet.getRange("A2:A1000").setHorizontalAlignment("center").setVerticalAlignment("middle");
+  sheet.getRange("B2:B1000").setHorizontalAlignment("center").setVerticalAlignment("middle");
+  sheet.getRange("C2:C1000").setHorizontalAlignment("center").setVerticalAlignment("middle");
+  sheet.getRange("D2:D1000").setHorizontalAlignment("center").setVerticalAlignment("middle");
+  sheet.getRange("E2:E1000").setHorizontalAlignment("center").setVerticalAlignment("middle");
+  sheet.getRange("F2:F1000").setHorizontalAlignment("center").setVerticalAlignment("middle");
+  sheet.getRange("G2:G1000").setHorizontalAlignment("center").setVerticalAlignment("middle");
+  sheet.getRange("H2:H1000").setHorizontalAlignment("left").setVerticalAlignment("middle");
+  sheet.getRange("I2:I1000").setHorizontalAlignment("center").setVerticalAlignment("middle");
+  sheet.getRange("J2:J1000").setHorizontalAlignment("left").setVerticalAlignment("middle");
+  
+  // 5. 設定 Finished Successfully (I欄) 條件格式化規則 (Y:綠, N:紅)
+  const statusRange = sheet.getRange("I2:I1000");
+  
+  const ruleY = SpreadsheetApp.newConditionalFormatRule()
+      .whenTextEqualTo("Y")
+      .setBackground("#DCFCE7") // 淺綠
+      .setFontColor("#166534") // 深綠
+      .bold(true)
+      .setRanges([statusRange])
+      .build();
+      
+  const ruleN = SpreadsheetApp.newConditionalFormatRule()
+      .whenTextEqualTo("N")
+      .setBackground("#FEE2E2") // 淺紅
+      .setFontColor("#991B1B") // 深紅
+      .bold(true)
+      .setRanges([statusRange])
+      .build();
+      
+  sheet.setConditionalFormatRules([ruleY, ruleN]);
+  Logger.log("Applied premium aesthetic formats and conditional rules to AI_Execution_Log sheet.");
+}
+
+/**
+ * 使用 Gmail REST API 將指定的 thread 移動到合適的 Gmail 收件匣分頁 (Category)
+ * @param {string} threadId Gmail 對話串 ID
+ * @param {string} tabLabelId Gmail 系統分頁標籤 ID (如 "CATEGORY_SOCIAL")
+ */
+function moveThreadToGmailCategory(threadId, tabLabelId) {
+  if (!threadId || !tabLabelId) return;
+  const url = `https://gmail.googleapis.com/gmail/v1/users/me/threads/${threadId}/modify`;
+  const token = ScriptApp.getOAuthToken();
+  
+  // 為了防止重複出現在多個分頁，加入該分頁，並移除其他系統分頁標籤
+  const systemCategories = [
+    "CATEGORY_PERSONAL",
+    "CATEGORY_SOCIAL",
+    "CATEGORY_PROMOTIONS",
+    "CATEGORY_UPDATES",
+    "CATEGORY_FORUMS"
+  ];
+  const removeLabelIds = systemCategories.filter(cat => cat !== tabLabelId);
+  
+  const payload = {
+    "addLabelIds": [tabLabelId],
+    "removeLabelIds": removeLabelIds
+  };
+  
+  const options = {
+    "method": "post",
+    "contentType": "application/json",
+    "headers": {
+      "Authorization": "Bearer " + token
+    },
+    "payload": JSON.stringify(payload),
+    "muteHttpExceptions": true
+  };
+  
+  try {
+    const response = UrlFetchApp.fetch(url, options);
+    const code = response.getResponseCode();
+    if (code !== 200) {
+      Logger.log(`Warning: Failed to set Gmail category for thread ${threadId}. Code: ${code}, Body: ${response.getContentText()}`);
+    } else {
+      Logger.log(`Successfully moved thread ${threadId} to Gmail Category: ${tabLabelId}`);
+    }
+  } catch (e) {
+    Logger.log(`Error calling Gmail API for thread ${threadId}: ` + e.toString());
+  }
+}
+
