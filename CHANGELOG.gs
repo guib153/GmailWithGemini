@@ -9,6 +9,12 @@
 /*
 # 變更日誌 (Changelist / Change Note)
 
+## [3.1.0] - 2026-06-16
+
+### 新增功能 (New Features)
+- **試算表專屬選單**：新增 `onOpen` 函式，在 Google 試算表上方加入「🤖 Gmail AI 工具」專屬選單。
+- **AI 統整 Few-Shot 規則**：實作 `consolidateFewShotExamples` 功能。當使用者在 `AI_PromptConfig` 表格中累積過多歷史分類規則時，可點擊選單按鈕，一鍵喚醒 AI（動態讀取使用者所選模型）將上百條相似的規則歸納、去重複並合併為 5~10 條精華規則，有效控制 Prompt 長度並提升執行效率。
+
 ## [3.0.0] - 2026-06-15
 
 ### 變更動機 (Motivation)
