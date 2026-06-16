@@ -168,6 +168,7 @@ function autoOrganizeGmailWithGemini() {
               if (!minDate || d < minDate) minDate = d;
               if (!maxDate || d > maxDate) maxDate = d;
               Logger.log(`[AI] ${item.senderEmail} → ${category} (${urgency})`);
+                try { updateAutoLearnTracker(item.senderEmail, category, item.rawSender); } catch(e) {}
             } else {
               failureCount++;
               category = "未分類"; urgency = "低";
@@ -721,8 +722,8 @@ function callGeminiApiBatchWithRetry(apiKey, emailList, promptConfig) {
         Logger.log(`Rate limit (429). Retry ${attempt+1}/${API_MAX_RETRIES} after ${wait/1000}s...`);
         Utilities.sleep(wait);
       } else if (e.message && e.message.indexOf('429') !== -1) {
-        Logger.log('Rate limit: all retries exhausted.');
-        return null;
+        Logger.log('Rate limit: all retries exhausted. Throwing error to abort execution.');
+        throw new Error('QUOTA_EXHAUSTED');
       } else { throw e; }
     }
   }
@@ -1035,8 +1036,6 @@ function processUncategorizedSheet() {
         sheet.getRange(i + 2, 8).setValue('✅ 已完成');
         // 儲存學習規則
         saveToLearningRules(email, rawSender, subject, manualCat);
-        // 同步至 AI_PromptConfig 範例
-        addExampleToPromptConfig_(email, subject, bodySnippet, manualCat, '低', '[人工修正]');
         processed++;
         Logger.log(`processUncategorizedSheet: Row ${i+2} → ${manualCat} ✅`);
       } catch(e) {
@@ -1046,28 +1045,6 @@ function processUncategorizedSheet() {
     });
     Logger.log(`processUncategorizedSheet done. Processed: ${processed} item(s).`);
   } catch(e) { Logger.log('processUncategorizedSheet exception: ' + e); }
-}
-
-/** 將人工修正結果新增為 AI_PromptConfig 的 Few-Shot 範例 */
-function addExampleToPromptConfig_(email, subject, bodySnippet, category, urgency, refined) {
-  try {
-    const sheet = getOrCreatePromptConfigSheet();
-    const lastRow = sheet.getLastRow();
-    const data = sheet.getRange(1, 1, lastRow, 1).getValues();
-    let exHeaderRow = -1;
-    for (let i = 0; i < data.length; i++) {
-      if (String(data[i][0]).includes('區塊三')) { exHeaderRow = i + 2; break; } // +2 for header row
-    }
-    if (exHeaderRow < 0) return;
-    // 找到第一個空列
-    const exData = sheet.getRange(exHeaderRow + 1, 1, Math.max(1, lastRow - exHeaderRow), 8).getValues();
-    let insertRow = lastRow + 1;
-    for (let i = 0; i < exData.length; i++) {
-      if (!String(exData[i][0]).trim()) { insertRow = exHeaderRow + 1 + i; break; }
-    }
-    sheet.getRange(insertRow, 1, 1, 8).setValues([[`人工修正-${category}`, email, subject.substring(0,30), bodySnippet, category, urgency, refined, '✅啟用']]);
-    Logger.log(`Added example to AI_PromptConfig row ${insertRow}.`);
-  } catch(e) { Logger.log('addExampleToPromptConfig_ error: ' + e); }
 }
 
 // =========================================================================
@@ -1360,168 +1337,73 @@ function checkApiKeyStatus() {
 
 /**
  * 建立試算表自訂選單
- */
-function onOpen(e) {
-  try {
-    SpreadsheetApp.getUi()
-      .createMenu('🤖 Gmail AI 工具')
-      .addItem('✨ AI 統整 Few-Shot 學習範例', 'consolidateFewShotExamples')
-      .addToUi();
-  } catch(e) {}
+
+// =========================================================================
+// ==================== AI_AutoLearnTracker (v4.0) =========================
+// =========================================================================
+
+const TRACKER_SHEET_NAME = 'AI_AutoLearnTracker';
+const AUTO_LEARN_SAFE_CATEGORIES = ['促銷行銷', '社群通知', '電子報', '系統通知', '登入成功通知'];
+const AUTO_LEARN_THRESHOLD = 3;
+
+/** 取得或建立 AI_AutoLearnTracker 工作表 (隱藏) */
+function getOrCreateAutoLearnTrackerSheet() {
+  const ss = getOrCreateSpreadsheet_();
+  let sheet = ss.getSheetByName(TRACKER_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(TRACKER_SHEET_NAME);
+    sheet.appendRow(['Sender Email', 'Category', 'Count', 'Last Update']);
+    sheet.setFrozenRows(1);
+    sheet.hideSheet(); // 隱藏此工作表，不干擾使用者
+    Logger.log('Created AI_AutoLearnTracker sheet.');
+  }
+  return sheet;
 }
 
 /**
- * AI 統整規則功能
+ * 更新寄件者的自動學習計數。如果達到閾值，則自動加入本地學習庫。
  */
-function consolidateFewShotExamples() {
-  const ui = SpreadsheetApp.getUi();
+function updateAutoLearnTracker(senderEmail, category, rawSender) {
+  if (!AUTO_LEARN_SAFE_CATEGORIES.includes(category)) return;
+  if (!senderEmail) return;
+
   try {
-    const sheet = getOrCreatePromptConfigSheet();
-    const lastRow = sheet.getLastRow();
-    const data = sheet.getRange(1, 1, lastRow, 8).getValues();
-    
-    // 找出區塊三的標題列
-    let exHeaderRow = -1;
-    for (let i = 0; i < data.length; i++) {
-      if (String(data[i][0]).includes('區塊三')) { exHeaderRow = i + 2; break; }
-    }
-    
-    if (exHeaderRow < 0) {
-      ui.alert('錯誤', '找不到【區塊三：Few-Shot 學習範例區】的標題，請確認表格結構是否正確。', ui.ButtonSet.OK);
-      return;
-    }
-    
-    // 收集現有範例
-    const examples = [];
-    let startRow = exHeaderRow + 1;
-    for (let i = exHeaderRow; i < data.length; i++) {
-      const label = String(data[i][0]).trim();
-      const enabled = String(data[i][7]).trim();
-      if (label && enabled !== '停用') {
-        examples.push({
-          label: label,
-          sender: String(data[i][1]).trim(),
-          subject: String(data[i][2]).trim(),
-          body: String(data[i][3]).trim(),
-          category: String(data[i][4]).trim(),
-          urgency: String(data[i][5]).trim(),
-          refined: String(data[i][6]).trim()
-        });
+    const sheet = getOrCreateAutoLearnTrackerSheet();
+    const data = sheet.getDataRange().getValues();
+    let foundRow = -1;
+    let currentCount = 0;
+
+    for (let i = 1; i < data.length; i++) {
+      if (data[i][0] === senderEmail) {
+        foundRow = i + 1;
+        if (data[i][1] === category) {
+          currentCount = Number(data[i][2]) || 0;
+        } else {
+          // 如果寄件者分類改變了，重置計數
+          currentCount = 0; 
+        }
+        break;
       }
     }
-    
-    if (examples.length < 5) {
-      ui.alert('提示', `目前只有 ${examples.length} 筆啟用的範例，數量尚少，不需要使用 AI 統整。\n建議累積超過 10 筆後再使用本功能。`, ui.ButtonSet.OK);
-      return;
-    }
-    
-    const response = ui.alert('確認執行', `即將把現有的 ${examples.length} 筆範例交給 AI 進行「歸納合併與去重」，並將結果覆蓋現有範例（預計濃縮成 5~10 筆精華規則）。\n這需要花費數十秒，是否繼續？`, ui.ButtonSet.YES_NO);
-    
-    if (response !== ui.Button.YES) return;
-    
-    sheet.getRange(startRow, 1).setValue('⏳ AI 正在統整規則中，請稍候...');
-    
-    const apiKey = PropertiesService.getScriptProperties().getProperty(GEMINI_API_KEY_PROPERTY);
-    if (!apiKey) {
-      ui.alert('錯誤', '找不到 API Key，請先設定 GEMINI_API_KEY 屬性。', ui.ButtonSet.OK);
-      sheet.getRange(startRow, 1).clearContent();
-      return;
-    }
-    
-    const model = getSelectedModel(); // 動態抓取 AI_PromptConfig 設定的模型
-    
-    const promptText = `你是一個專業的郵件分類 AI 助手。以下是用戶長期累積的 ${examples.length} 筆 Few-Shot 郵件分類學習範例。
-請幫我將這些範例進行「歸納、去重複與合併同類項」。
-例如：如果有多筆來自 UberEats 的訂單範例，請合併成一筆，並將主旨/內文條件稍微泛化（例如加上 "訂單" 等關鍵字）。
-請保留最具代表性、覆蓋面最廣的 5~10 筆範例。
-你的輸出必須是一個純 JSON 陣列，絕對不能包含 Markdown 標籤 (例如 \`\`\`json)，格式如下：
-[
-  {
-    "label": "統整範例-...",
-    "sender": "...",
-    "subject": "...",
-    "body": "...",
-    "category": "...",
-    "urgency": "...",
-    "refined": "..."
-  }
-]
 
-範例資料如下：
-${JSON.stringify(examples, null, 2)}`;
+    currentCount++;
+    const nowStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
 
-    // 呼叫 Gemini API
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-    const payload = {
-      "contents": [{ "parts": [{ "text": promptText }] }],
-      "generationConfig": { "temperature": 0.2 }
-    };
-    
-    const options = {
-      "method": "post",
-      "contentType": "application/json",
-      "payload": JSON.stringify(payload),
-      "muteHttpExceptions": true
-    };
-    
-    const res = UrlFetchApp.fetch(url, options);
-    const code = res.getResponseCode();
-    const resText = res.getContentText();
-    
-    if (code !== 200) {
-      sheet.getRange(startRow, 1).clearContent();
-      ui.alert('API 錯誤', `無法統整，錯誤碼：${code}\n可能是您的免費配額已耗盡，請稍後再試。`, ui.ButtonSet.OK);
-      return;
+    if (currentCount >= AUTO_LEARN_THRESHOLD) {
+      Logger.log(`Auto-Learn: ${senderEmail} reached threshold for ${category}! Saving to local rules.`);
+      saveToLearningRules(senderEmail, rawSender, "", category);
+      // 從 Tracker 中刪除，因為已經學會了
+      if (foundRow > 0) {
+        sheet.deleteRow(foundRow);
+      }
+    } else {
+      if (foundRow > 0) {
+        sheet.getRange(foundRow, 2, 1, 3).setValues([[category, currentCount, nowStr]]);
+      } else {
+        sheet.appendRow([senderEmail, category, currentCount, nowStr]);
+      }
     }
-    
-    const jsonRes = JSON.parse(resText);
-    let aiOutput = "";
-    if (jsonRes.candidates && jsonRes.candidates.length > 0) {
-      aiOutput = jsonRes.candidates[0].content.parts[0].text;
-    }
-    
-    if (!aiOutput) {
-      sheet.getRange(startRow, 1).clearContent();
-      ui.alert('解析失敗', 'AI 沒有回傳有效的內容。', ui.ButtonSet.OK);
-      return;
-    }
-    
-    aiOutput = aiOutput.replace(/```json/gi, '').replace(/```/g, '').trim();
-    
-    let newExamples;
-    try {
-      newExamples = JSON.parse(aiOutput);
-      if (!Array.isArray(newExamples)) throw new Error('Not an array');
-    } catch(e) {
-      sheet.getRange(startRow, 1).clearContent();
-      ui.alert('JSON 解析失敗', `AI 回傳的格式不正確，無法更新。\n回傳內容：${aiOutput.substring(0, 200)}`, ui.ButtonSet.OK);
-      return;
-    }
-    
-    // 刪除舊有範例
-    const numRowsToDelete = lastRow - exHeaderRow;
-    if (numRowsToDelete > 0) {
-      sheet.getRange(startRow, 1, numRowsToDelete, 8).clearContent();
-    }
-    
-    // 寫入新範例
-    const outputData = newExamples.map(ex => [
-      ex.label || '統整範例',
-      ex.sender || '',
-      ex.subject || '',
-      ex.body || '',
-      ex.category || '',
-      ex.urgency || '',
-      ex.refined || '',
-      '✅啟用'
-    ]);
-    
-    sheet.getRange(startRow, 1, outputData.length, 8).setValues(outputData);
-    
-    ui.alert('成功', `已將 ${examples.length} 筆原始範例濃縮為 ${outputData.length} 筆精華規則！`, ui.ButtonSet.OK);
-    
   } catch(e) {
-    ui.alert('執行時發生未預期錯誤', String(e), ui.ButtonSet.OK);
-    Logger.log('consolidateFewShotExamples exception: ' + e);
+    Logger.log("updateAutoLearnTracker error: " + e);
   }
 }
