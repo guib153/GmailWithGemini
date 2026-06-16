@@ -36,7 +36,7 @@ const BATCH_SIZE = 10;         // 每批次同時處理的信件數量
 const BATCH_DELAY_MS = 2000;   // 批次之間的等待毫秒數
 
 // 8.2 自動排程間隔 (v3.0)
-const TRIGGER_INTERVAL_HOURS = 1; // 自動分類觸發間隔 (小時)：1=每小時, 2=每2小時
+const TRIGGER_INTERVAL_HOURS = 6; // 自動分類觸發間隔 (小時)：1=每小時, 2=每2小時, 6=每6小時
 
 // 8.3 每日摘要 Email 收件人（留空則寄給執行腳本的帳號本身）
 const DIGEST_RECIPIENT_EMAIL = '';
