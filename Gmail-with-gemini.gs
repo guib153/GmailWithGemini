@@ -316,7 +316,7 @@ function formatSheetAesthetics(sheet) {
       .whenTextEqualTo("高")
       .setBackground("#FEE2E2") // 淺紅
       .setFontColor("#991B1B") // 深紅
-      .bold(true)
+      .setBold(true)
       .setRanges([urgencyRange])
       .build();
       
@@ -324,7 +324,7 @@ function formatSheetAesthetics(sheet) {
       .whenTextEqualTo("中")
       .setBackground("#FEF3C7") // 淺黃
       .setFontColor("#92400E") // 深黃
-      .bold(true)
+      .setBold(true)
       .setRanges([urgencyRange])
       .build();
       
@@ -535,7 +535,7 @@ function formatExecutionLogSheetAesthetics(sheet) {
       .whenTextEqualTo("Y")
       .setBackground("#DCFCE7") // 淺綠
       .setFontColor("#166534") // 深綠
-      .bold(true)
+      .setBold(true)
       .setRanges([statusRange])
       .build();
       
@@ -543,7 +543,7 @@ function formatExecutionLogSheetAesthetics(sheet) {
       .whenTextEqualTo("N")
       .setBackground("#FEE2E2") // 淺紅
       .setFontColor("#991B1B") // 深紅
-      .bold(true)
+      .setBold(true)
       .setRanges([statusRange])
       .build();
       
@@ -949,7 +949,7 @@ function getOrCreateUncategorizedSheet() {
     const categoryValidation = SpreadsheetApp.newDataValidation().requireValueInList(VALID_CATEGORIES, true).build();
     sheet.getRange(2, 7, 500, 1).setDataValidation(categoryValidation);
     // 「狀態」欄條件格式化
-    const pendingRule = SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('待審查').setBackground('#FEF3C7').setFontColor('#92400E').bold(true).setRanges([sheet.getRange('H2:H500')]).build();
+    const pendingRule = SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('待審查').setBackground('#FEF3C7').setFontColor('#92400E').setBold(true).setRanges([sheet.getRange('H2:H500')]).build();
     const doneRule   = SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('✅ 已完成').setBackground('#DCFCE7').setFontColor('#166534').setRanges([sheet.getRange('H2:H500')]).build();
     const failRule   = SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('❌ 處理失敗').setBackground('#FEE2E2').setFontColor('#991B1B').setRanges([sheet.getRange('H2:H500')]).build();
     sheet.setConditionalFormatRules([pendingRule, doneRule, failRule]);
