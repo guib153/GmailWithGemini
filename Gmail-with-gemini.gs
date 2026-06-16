@@ -1006,6 +1006,15 @@ function processUncategorizedSheet() {
       try {
         const threads = GmailApp.getThreadById(threadId);
         if (!threads) { throw new Error('Thread not found: ' + threadId); }
+        
+        let bodySnippet = '';
+        try {
+          const msgs = threads.getMessages();
+          if (msgs && msgs.length > 0) {
+            bodySnippet = msgs[0].getPlainBody().replace(/\s+/g, ' ').substring(0, 200);
+          }
+        } catch(e) {}
+        
         // 移除 AI/未分類 標籤
         const oldLabel = GmailApp.getUserLabelByName('AI/未分類');
         if (oldLabel) threads.removeLabel(oldLabel);
@@ -1027,7 +1036,7 @@ function processUncategorizedSheet() {
         // 儲存學習規則
         saveToLearningRules(email, rawSender, subject, manualCat);
         // 同步至 AI_PromptConfig 範例
-        addExampleToPromptConfig_(email, subject, manualCat, '低', '[人工修正]');
+        addExampleToPromptConfig_(email, subject, bodySnippet, manualCat, '低', '[人工修正]');
         processed++;
         Logger.log(`processUncategorizedSheet: Row ${i+2} → ${manualCat} ✅`);
       } catch(e) {
@@ -1040,7 +1049,7 @@ function processUncategorizedSheet() {
 }
 
 /** 將人工修正結果新增為 AI_PromptConfig 的 Few-Shot 範例 */
-function addExampleToPromptConfig_(email, subject, category, urgency, refined) {
+function addExampleToPromptConfig_(email, subject, bodySnippet, category, urgency, refined) {
   try {
     const sheet = getOrCreatePromptConfigSheet();
     const lastRow = sheet.getLastRow();
@@ -1056,7 +1065,7 @@ function addExampleToPromptConfig_(email, subject, category, urgency, refined) {
     for (let i = 0; i < exData.length; i++) {
       if (!String(exData[i][0]).trim()) { insertRow = exHeaderRow + 1 + i; break; }
     }
-    sheet.getRange(insertRow, 1, 1, 8).setValues([[`人工修正-${category}`, email, subject.substring(0,30), '', category, urgency, refined, '✅']]);
+    sheet.getRange(insertRow, 1, 1, 8).setValues([[`人工修正-${category}`, email, subject.substring(0,30), bodySnippet, category, urgency, refined, '✅啟用']]);
     Logger.log(`Added example to AI_PromptConfig row ${insertRow}.`);
   } catch(e) { Logger.log('addExampleToPromptConfig_ error: ' + e); }
 }
